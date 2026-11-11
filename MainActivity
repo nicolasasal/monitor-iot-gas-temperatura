@@ -1,0 +1,166 @@
+package com.example.iotappgasytemperatura
+
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import org.eclipse.paho.client.mqttv3.IMqttActionListener
+import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken
+import org.eclipse.paho.client.mqttv3.IMqttToken
+import org.eclipse.paho.client.mqttv3.MqttAsyncClient
+import org.eclipse.paho.client.mqttv3.MqttCallbackExtended
+import org.eclipse.paho.client.mqttv3.MqttConnectOptions
+import org.eclipse.paho.client.mqttv3.MqttException
+import org.eclipse.paho.client.mqttv3.MqttMessage
+import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
+import androidx.compose.foundation.layout.Row
+import androidx.compose.material3.Button
+import androidx.compose.runtime.mutableStateListOf
+
+class MainActivity : ComponentActivity() {
+
+    // Dirección del broker, con el formato  tcp://host:puerto
+    private val BROKER = "ssl://broker.hivemq.com:8883"
+    private val TOPIC_TEMP = "tensurapjr/temperatura"
+    private val TOPIC_GAS  = "tensurapjr/gas"
+    private val TOPIC_ALARMA_CMD = "tensurapjr/alarma/control"
+    private val TOPIC_ALARMA_EST = "tensurapjr/alarma/estado"
+    private val TOPIC_HIST = "tensurapjr/historial"
+    private val comandosPendientes = mutableStateListOf<String>()
+
+    private var cliente: MqttAsyncClient? = null
+
+    // Texto que se muestra en pantalla. Si cambia, la pantalla se actualiza sola.
+    private var estadoConexion by mutableStateOf("Conectando...")
+    private var temperatura by mutableStateOf("--")
+    private var gas by mutableStateOf("--")
+
+    private var alarma by mutableStateOf("--")
+    private var recibidosHistorial by mutableStateOf(0)
+    private val historial = mutableStateListOf<String>()
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        setContent {
+            MaterialTheme {
+                Column(
+                    modifier = Modifier.fillMaxSize().padding(24.dp),
+                    verticalArrangement = Arrangement.Center,
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text("Monitor IoT", fontSize = 28.sp)
+                    Spacer(Modifier.height(16.dp))
+                    Text("Estado: $estadoConexion", fontSize = 20.sp)
+                    Spacer(Modifier.height(24.dp))
+                    Text("Temperatura: $temperatura °C", fontSize = 20.sp)
+                    Spacer(Modifier.height(8.dp))
+                    Text("Gas: $gas", fontSize = 20.sp)
+                    Spacer(Modifier.height(24.dp))
+                    Text("Alarma: $alarma", fontSize = 20.sp)
+                    Spacer(Modifier.height(16.dp))
+                    Spacer(Modifier.height(8.dp))
+                    Text("Historial recibido: $recibidosHistorial", fontSize = 16.sp)
+                    Text("Última lectura: ${historial.lastOrNull() ?: "--"}", fontSize = 16.sp)
+                    Text("Órdenes pendientes: ${comandosPendientes.size}", fontSize = 16.sp)   // <- NUEVA
+                    Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                        Button(onClick = { publicar(TOPIC_ALARMA_CMD, "ON") }) { Text("Encender") }
+                        Button(onClick = { publicar(TOPIC_ALARMA_CMD, "OFF") }) { Text("Apagar") }
+                    }
+                }
+            }
+        }
+
+        conectar()
+    }
+
+    private fun publicar(topic: String, mensaje: String) {
+        try {
+            if (cliente?.isConnected == true) {
+                cliente?.publish(topic, MqttMessage(mensaje.toByteArray()))
+            }else{
+                comandosPendientes.add(mensaje)
+            }
+        } catch (e: Exception) { }
+    }
+
+    private fun enviarComandosPendientes() {
+        for (m in comandosPendientes) {
+            cliente?.publish(TOPIC_ALARMA_CMD, MqttMessage(m.toByteArray()))
+        }
+        comandosPendientes.clear()
+    }
+
+    private fun conectar() {
+        val idCliente = "app-" + System.currentTimeMillis()
+        val c = MqttAsyncClient(BROKER, idCliente, MemoryPersistence())
+        cliente = c
+
+        // Qué hacer cuando cambia la conexión
+        c.setCallback(object : MqttCallbackExtended {
+            override fun connectComplete(reconnect: Boolean, serverURI: String?) {
+                estadoConexion = "Online"
+                try {
+                    cliente?.subscribe(TOPIC_TEMP, 0)
+                    cliente?.subscribe(TOPIC_GAS, 0)
+                    cliente?.subscribe(TOPIC_ALARMA_EST, 0)
+                    cliente?.subscribe(TOPIC_HIST, 0)
+                    enviarComandosPendientes()
+                } catch (e: Exception) { }
+            }
+            override fun connectionLost(cause: Throwable?) {
+                estadoConexion = "Offline"
+            }
+            override fun messageArrived(topic: String?, message: MqttMessage?) {
+                val texto = message?.toString() ?: ""
+                when (topic) {
+                    TOPIC_TEMP -> temperatura = texto
+                    TOPIC_GAS -> gas = texto
+                    TOPIC_ALARMA_EST -> alarma = texto
+                    TOPIC_HIST -> {
+                        recibidosHistorial = recibidosHistorial + 1
+                        historial.add(texto)
+                    }
+                }
+            }
+            override fun deliveryComplete(token: IMqttDeliveryToken?) {}
+        })
+
+        val opciones = MqttConnectOptions().apply {
+            isAutomaticReconnect = true
+            isCleanSession = true
+            connectionTimeout = 10
+            keepAliveInterval = 20
+        }
+
+        try {
+            c.connect(opciones, null, object : IMqttActionListener {
+                override fun onSuccess(asyncActionToken: IMqttToken?) {}
+                override fun onFailure(asyncActionToken: IMqttToken?, exception: Throwable?) {
+                    estadoConexion = "Error"
+                }
+            })
+        } catch (e: MqttException) {
+            estadoConexion = "Error"
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        try { cliente?.disconnect() } catch (e: Exception) { }
+    }
+}
